@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  nvm-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nvm_monoio_env
+    volumes:
+      # Monta el código fuente actual del host hacia el contenedor.
+      # Esto te permite usar tu IDE en Windows mientras Rust compila en Linux.
+      - .:/usr/src/nvm_prototype
+      # Montaje para mantener el caché de Cargo persistente entre reinicios.
+      - cargo-registry:/usr/local/cargo/registry
+    working_dir: /usr/src/nvm_prototype
+    ports:
+      - "8080:8080"
+    
+    # --- CONFIGURACIONES CRÍTICAS PARA IO_URING ---
+    security_opt:
+      # Docker bloquea por defecto las llamadas al sistema (syscalls) nuevas o consideradas
+      # peligrosas. Las llamadas io_uring_setup, io_uring_enter y io_uring_register
+      # frecuentemente chocan con el perfil seccomp predeterminado. 'unconfined' lo deshabilita.
+      - seccomp:unconfined
+      
+    ulimits:
+      memlock:
+        # io_uring requiere bloquear los anillos de sumisión/completitud en la memoria física
+        # (evitando el swap). Configuramos esto como ilimitado.
+        soft: -1
+        hard: -1
+        
+    cap_add:
+      # IPC_LOCK: Permite al proceso bloquear memoria física explícitamente.
+      - IPC_LOCK
+      # SYS_NICE: Permite que monoio o el Thread-Per-Core cambie la prioridad del proceso 
+      # para evitar interrupciones de scheduling (vital para latencia ultra-baja).
+      - SYS_NICE
+
+volumes:
+  cargo-registry:

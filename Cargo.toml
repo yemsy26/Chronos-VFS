@@ -1,0 +1,9 @@
+[package]
+name = "nvm_prototype"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9.10"
+monoio = "0.2.4"
+tokio = { version = "1.52.3", features = ["full"] }
