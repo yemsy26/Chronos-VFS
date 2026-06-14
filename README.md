@@ -56,8 +56,8 @@ A native Python stress client using `asyncio` and `aiohttp` evaluated the data-s
 
 ## Author & Citation
 
-**Yemsy**
-- **Profession:** Systems Engineer
+**Ramon Antonio Burgos Jerez**
+- **Profession:** B.S. in Computer Science (Licenciado en Informática)
 - **GitHub:** [@yemsy26](https://github.com/yemsy26)
 
 *This project was architected and developed as an advanced proof of concept in Computer Architecture, addressing Memory-Bound constraints and Non-Von Neumann software design.*
