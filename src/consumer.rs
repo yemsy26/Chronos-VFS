@@ -1,110 +1,130 @@
-use crate::nvm_core::CommandRingBuffer;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use std::future::Future;
-use std::task::{Poll, Context};
-use std::pin::Pin;
+//! Hilo consumidor: drena el anillo, comprime con zstd al vuelo y vuelca a disco.
 
-/// Estructura de mercado plana y estructurada
-/// `#[repr(C)]` asegura que el layout binario es exacto y compatible
-/// con las arquitecturas estándar (C, Python struct, etc).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MarketTick {
-    pub timestamp: u64,
-    pub price: f64,
-    pub volume: f64,
+use crate::nvm_core::{CHUNK_SIZE, Consumer};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+use std::thread::{self, JoinHandle};
+
+/// Tope de bytes por pasada de compresión. Aunque el anillo esté lleno, el espacio se
+/// devuelve al productor cada `DRAIN_BATCH` bytes y no al terminar de drenarlo entero.
+const DRAIN_BATCH: usize = 64 * CHUNK_SIZE;
+/// Buffer de salida hacia el archivo: agrupa los bloques comprimidos en escrituras grandes.
+const OUT_BUFFER: usize = 1 << 20;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ZstdConfig {
+    /// Nivel de compresión zstd (1 = más rápido, 3 = por defecto, hasta 22).
+    pub level: i32,
+    /// Hilos de compresión adicionales. Con 0 se comprime en el propio hilo consumidor;
+    /// cada worker añade sus propios buffers de trabajo a la memoria del compresor.
+    pub workers: u32,
+    /// Añade al frame un checksum XXH64 del contenido original.
+    pub checksum: bool,
 }
 
-pub struct StateEngine {
-    base_seed: u64,
-    pub processed_events: AtomicUsize,
-}
-
-impl StateEngine {
-    pub fn new(seed: u64) -> Self {
+impl Default for ZstdConfig {
+    fn default() -> Self {
         Self {
-            base_seed: seed,
-            processed_events: AtomicUsize::new(0),
-        }
-    }
-
-    #[inline(always)]
-    pub fn process_command(&self, cmd: u64) {
-        let _virtual_state = self.calculate_virtual_node(cmd);
-        self.processed_events.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn calculate_virtual_node(&self, id: u64) -> u64 {
-        id.wrapping_mul(self.base_seed) ^ 0xDEADBEEFCAFEBABE
-    }
-
-    /// Genera determinísticamente un MarketTick basado en un índice lógico.
-    /// Simula la extracción matemática in-situ de datos de un HFT en vez de leer de disco.
-    #[inline(always)]
-    pub fn generate_tick(&self, tick_index: u64) -> MarketTick {
-        // Timestamp perfectamente secuencial para la validación (cada tick = 100ms lógicos)
-        let timestamp = 1600000000000 + (tick_index * 100);
-        
-        // Entropía determinista
-        let mut seed = tick_index.wrapping_mul(self.base_seed);
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-
-        // Precio base 50000.0 con variación pseudoaleatoria predictible (-50.0 a 49.99)
-        let price = 50000.0 + ((seed % 10000) as f64 - 5000.0) / 100.0;
-        
-        // Volumen pseudoaleatorio
-        let volume = ((seed >> 16) % 500) as f64 + 1.5;
-
-        MarketTick {
-            timestamp,
-            price,
-            volume,
+            level: zstd::DEFAULT_COMPRESSION_LEVEL,
+            workers: 0,
+            checksum: true,
         }
     }
 }
 
-pub struct RingBufferPoller<'a, T> {
-    ring: &'a CommandRingBuffer<T>,
-    spin_limit: usize,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SinkStats {
+    /// Bytes drenados del anillo.
+    pub raw_bytes: u64,
+    /// Bytes entregados al destino tras comprimir.
+    pub compressed_bytes: u64,
 }
 
-impl<'a, T> RingBufferPoller<'a, T> {
-    pub fn new(ring: &'a CommandRingBuffer<T>, spin_limit: usize) -> Self {
-        Self { ring, spin_limit }
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let count = self.inner.write(buf)?;
+        self.written += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
-impl<'a, T: Unpin> Future for RingBufferPoller<'a, T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut spins = 0;
-        loop {
-            if let Some(cmd) = self.ring.pop() {
-                return Poll::Ready(cmd);
-            }
-            
-            spins += 1;
-            if spins >= self.spin_limit {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            
-            core::hint::spin_loop();
-        }
+/// Lazo del consumidor. Drena `consumer` hasta que el productor cierre, alimentando al
+/// compresor directamente desde la memoria del anillo, y cierra el frame zstd sobre `out`.
+///
+/// No hay copia intermedia del flujo: la RAM es el anillo más el estado de tamaño fijo
+/// del compresor. Si falla, el `Consumer` se suelta y el productor recibe `BrokenPipe`.
+pub fn drain_to_zstd<W: Write>(
+    mut consumer: Consumer,
+    out: W,
+    config: ZstdConfig,
+) -> io::Result<(W, SinkStats)> {
+    let out = CountingWriter { inner: out, written: 0 };
+    let mut encoder = zstd::stream::write::Encoder::new(out, config.level)?;
+    encoder.include_checksum(config.checksum)?;
+    if config.workers > 0 {
+        encoder.multithread(config.workers)?;
     }
+
+    let mut raw_bytes = 0u64;
+    while consumer.wait_for_data() {
+        let (front, back) = consumer.readable();
+        let front = &front[..front.len().min(DRAIN_BATCH)];
+        let back = &back[..back.len().min(DRAIN_BATCH - front.len())];
+        encoder.write_all(front)?;
+        encoder.write_all(back)?;
+        let count = front.len() + back.len();
+        consumer.release(count);
+        raw_bytes += count as u64;
+    }
+
+    let out = encoder.finish()?;
+    let stats = SinkStats {
+        raw_bytes,
+        compressed_bytes: out.written,
+    };
+    Ok((out.inner, stats))
 }
 
-pub async fn run_consumer_loop(ring: &CommandRingBuffer<u64>, engine: &StateEngine) {
-    loop {
-        let poller = RingBufferPoller::new(ring, 128);
-        let cmd = poller.await;
-        
-        if cmd == 0 { break; }
-        
-        engine.process_command(cmd);
+/// Hilo consumidor que comprime el anillo hacia un archivo `.zst`.
+pub struct ZstdSink {
+    thread: JoinHandle<io::Result<SinkStats>>,
+}
+
+impl ZstdSink {
+    /// Crea (o trunca) `path` y lanza el hilo que drena `consumer` sobre él.
+    pub fn spawn(
+        consumer: Consumer,
+        path: impl AsRef<Path>,
+        config: ZstdConfig,
+    ) -> io::Result<Self> {
+        let file = File::create(path)?;
+        let thread = thread::Builder::new()
+            .name("chronos-zstd".into())
+            .spawn(move || {
+                let out = BufWriter::with_capacity(OUT_BUFFER, file);
+                let (out, stats) = drain_to_zstd(consumer, out, config)?;
+                let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
+                file.sync_all()?;
+                Ok(stats)
+            })?;
+        Ok(Self { thread })
+    }
+
+    /// Espera a que el productor cierre y el archivo quede completo y sincronizado.
+    /// Debe llamarse después de soltar el `RingWriter`; hasta entonces bloquea.
+    pub fn join(self) -> io::Result<SinkStats> {
+        self.thread
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("el hilo consumidor entró en pánico")))
     }
 }

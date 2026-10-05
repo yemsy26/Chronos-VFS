@@ -1,59 +1,39 @@
-pub mod aura_bridge {
-    pub struct AuraAstNode {
-        pub node_id: u64,
-        pub parent_id: u64,
-        pub opcode: u8,
-        pub content_hash: String,
-        pub intent: String,
-        pub meta: [u8; 16],
-    }
+//! Chronos-VFS v2: puente de I/O en RAM entre un productor de trazas y el disco.
+//!
+//! ```no_run
+//! use std::io::Write;
+//!
+//! let (mut proof, sink) = chronos_vfs::zstd_bridge(
+//!     "proof.pbp.zst",
+//!     256 << 20,
+//!     chronos_vfs::ZstdConfig::default(),
+//! )?;
+//! writeln!(proof, "pseudo-Boolean proof version 3.0")?;
+//! proof.close();
+//! let stats = sink.join()?;
+//! println!("{} -> {} bytes", stats.raw_bytes, stats.compressed_bytes);
+//! # Ok::<(), std::io::Error>(())
+//! ```
 
-    pub struct AuraIntentTranslator;
-    impl AuraIntentTranslator {
-        pub fn tokenize_intent(
-            opcode: u8,
-            parent_id: u64,
-            node_id: u64,
-            intent: &str,
-            meta: [u8; 16],
-        ) -> AuraAstNode {
-            AuraAstNode {
-                node_id,
-                parent_id,
-                opcode,
-                content_hash: format!("{:x}", md5::compute(intent.as_bytes())), // mock hash
-                intent: intent.to_string(),
-                meta,
-            }
-        }
-    }
-}
+pub mod consumer;
+pub mod nvm_core;
+pub mod writer;
 
-pub mod workspace {
-    use super::aura_bridge::AuraAstNode;
-    
-    /// Type alias for the default workspace node type
-    pub type DefaultNode = AuraAstNode;
+pub use consumer::{SinkStats, ZstdConfig, ZstdSink, drain_to_zstd};
+pub use nvm_core::{CHUNK_SIZE, Consumer, Disconnected, Producer, RingBuffer};
+pub use writer::RingWriter;
 
-    pub struct AgentWorkspace<T> {
-        nodes: Vec<T>,
-        max_size: usize,
-    }
+use std::io;
+use std::path::Path;
 
-    impl<T> AgentWorkspace<T> {
-        pub fn new(max_size: usize) -> Result<Self, String> {
-            Ok(Self {
-                nodes: Vec::new(),
-                max_size,
-            })
-        }
-
-        pub fn push_node(&mut self, node: T) -> Result<(), String> {
-            if self.nodes.len() >= self.max_size {
-                return Err("Buffer full".to_string());
-            }
-            self.nodes.push(node);
-            Ok(())
-        }
-    }
+/// Monta el puente completo: un anillo de `ring_capacity` bytes (potencia de dos), su
+/// [`RingWriter`] para el productor y el hilo consumidor comprimiendo hacia `path`.
+pub fn zstd_bridge(
+    path: impl AsRef<Path>,
+    ring_capacity: usize,
+    config: ZstdConfig,
+) -> io::Result<(RingWriter, ZstdSink)> {
+    let (producer, consumer) = RingBuffer::with_capacity(ring_capacity);
+    let sink = ZstdSink::spawn(consumer, path, config)?;
+    Ok((RingWriter::new(producer), sink))
 }
